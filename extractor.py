@@ -79,7 +79,17 @@ def remove_accents(text: str) -> str:
 def normalize(text: str) -> str:
     return remove_accents(text.lower().strip())
 
+
+def _normalize_ocr_money_text(text: str) -> str:
+    # OCR hay nhầm O/o thành số 0 ở token tiền, ví dụ: 54,00O -> 54,000
+    text = re.sub(r'(?<=\d)[oO](?=[\d.,]|\b)', '0', text)
+    text = re.sub(r'(?<=[.,])[oO](?=\d|\b)', '0', text)
+    # Gom khoảng trắng ở giữa cụm số: 12 000 -> 12000
+    text = re.sub(r'(?<=\d)\s+(?=\d)', '', text)
+    return text
+
 def clean_number(text: str) -> Optional[int]:
+    text = _normalize_ocr_money_text(text)
     text = re.sub(r'[đĐ]|vnd|vnđ', '', text, flags=re.IGNORECASE)
     text = re.sub(r'\s', '', text)
     text = re.sub(r'[.,](?=\d{3}(\D|$))', '', text)
@@ -90,6 +100,7 @@ def clean_number(text: str) -> Optional[int]:
         return None
 
 def extract_numbers_from_line(text: str) -> list:
+    text = _normalize_ocr_money_text(text)
     text = re.sub(r'[đĐ]|vnd|vnđ', '', text, flags=re.IGNORECASE)
     results = []
     for m in re.findall(r'\d{1,3}(?:[.,]\d{3})+|\d{4,}', text):
@@ -158,16 +169,20 @@ def detect_receipt_type(blocks: list, body_items_count: int) -> str:
     supermarket_score = sum(1 for kw in _SUPERMARKET_KW if kw in full_text)
     normal_score      = sum(1 for kw in _NORMAL_KW      if kw in full_text)
 
-    # Nếu parse được >= 3 sản phẩm → chắc chắn siêu thị
-    if body_items_count >= 3:
+    # Chỉ dựa vào số item khi mật độ item thực sự dày.
+    if body_items_count >= 6:
+        return "supermarket"
+
+    # Với số item vừa phải, bắt buộc có thêm tín hiệu keyword siêu thị.
+    if body_items_count >= 4 and supermarket_score >= 1:
         return "supermarket"
 
     # Nếu có keyword siêu thị rõ ràng
     if supermarket_score >= 2:
         return "supermarket"
 
-    # Nếu parse được 1-2 sản phẩm và có keyword siêu thị
-    if body_items_count >= 1 and supermarket_score >= 1:
+    # Parse được vài item nhưng chỉ chốt siêu thị khi keyword đủ mạnh.
+    if body_items_count >= 2 and supermarket_score >= 2:
         return "supermarket"
 
     return "normal"
@@ -242,30 +257,118 @@ _TOTAL_KW = [
     'phai thanh toan', 'so tien thanh toan',
     'grand total', 'total amount', 'total', 'amount due',
 ]
+_TOTAL_PRIMARY_KW = [
+    'tong cong', 'tong tien', 'thanh tien',
+    'phai thanh toan', 'so tien thanh toan',
+    'grand total', 'total amount', 'amount due'
+]
 _NOT_TOTAL_KW = [
     'giam gia', 'discount', 'khuyen mai', 'voucher',
     'tien mat', 'cash', 'tien thua', 'change',
     'thue', 'vat', 'phi phuc vu', 'tich luy', 'diem',
 ]
 
-def extract_total(footer_blocks: list, all_blocks: list) -> Optional[int]:
-    candidates = []
-    for b in footer_blocks:
-        norm = normalize(b.text)
-        if any(kw in norm for kw in _NOT_TOTAL_KW): continue
-        if any(kw in norm for kw in _TOTAL_KW):
-            nums = extract_numbers_from_line(b.text)
-            if nums: candidates.append(max(nums))
+_TOTAL_EXCLUDE_KW = [
+    'tong so luong', 'so luong', 'qty', 'quantity',
+    'tong mon', 'tong item', 'tong sl',
+]
 
-    if candidates:
-        return max(candidates)
+
+def _block_text(block: object) -> str:
+    return getattr(block, 'text', None) or (block.get('text', '') if isinstance(block, dict) else '')
+
+
+def _block_y(block: object) -> float:
+    y = getattr(block, 'y', None)
+    if y is None and isinstance(block, dict):
+        y = block.get('y', 0.5)
+    try:
+        return float(y)
+    except Exception:
+        return 0.5
+
+
+def _is_total_label(norm: str) -> tuple[bool, bool]:
+    if not norm:
+        return False, False
+    if any(kw in norm for kw in _NOT_TOTAL_KW):
+        return False, False
+    if any(kw in norm for kw in _TOTAL_EXCLUDE_KW):
+        return False, False
+    strong = any(kw in norm for kw in _TOTAL_PRIMARY_KW)
+    weak = ('tong' in norm or 'total' in norm)
+    return strong or weak, strong
+
+def extract_total(footer_blocks: list, all_blocks: list) -> Optional[int]:
+    # Ưu tiên tìm tổng tiền theo nhãn trên toàn bộ blocks để tránh phụ thuộc cứng vào zone footer.
+    ordered = sorted(all_blocks, key=_block_y)
+    scored_candidates: list[tuple[int, float, int]] = []  # (score, y, value)
+
+    for idx, block in enumerate(ordered):
+        text = _block_text(block)
+        norm = normalize(text)
+        is_label, is_strong = _is_total_label(norm)
+        if not is_label:
+            continue
+
+        nums = extract_numbers_from_line(text)
+        value = nums[-1] if nums else None
+
+        # Hỗ trợ trường hợp nhãn ở dòng trên, số tiền ở dòng dưới.
+        if value is None and idx + 1 < len(ordered):
+            next_text = _block_text(ordered[idx + 1])
+            next_norm = normalize(next_text)
+            if not any(kw in next_norm for kw in _NOT_TOTAL_KW):
+                next_nums = extract_numbers_from_line(next_text)
+                if next_nums:
+                    value = next_nums[-1]
+
+        if value is None or value < 1_000 or value > 100_000_000:
+            continue
+
+        y = _block_y(block)
+        score = 0
+        if is_strong:
+            score += 120
+        if 'tong cong' in norm or 'tong tien' in norm or 'grand total' in norm or 'amount due' in norm:
+            score += 70
+        if 'total' in norm or 'tong' in norm:
+            score += 30
+        if y >= 0.60:
+            score += 25
+        if y >= 0.75:
+            score += 20
+
+        scored_candidates.append((score, y, value))
+
+    if scored_candidates:
+        # Ưu tiên score cao, nếu hòa thì lấy dòng thấp hơn (gần cuối hóa đơn hơn).
+        best = max(scored_candidates, key=lambda item: (item[0], item[1]))
+        return best[2]
+
+    # Fallback 1: footer có số, tránh các dòng bị loại.
+    footer_candidates = []
+    for block in footer_blocks:
+        text = _block_text(block)
+        norm = normalize(text)
+        if any(kw in norm for kw in _NOT_TOTAL_KW):
+            continue
+        nums = extract_numbers_from_line(text)
+        if nums:
+            footer_candidates.append(nums[-1])
+
+    footer_valid = [n for n in footer_candidates if 1_000 <= n <= 100_000_000]
+    if footer_valid:
+        return footer_valid[-1]
 
     # Fallback: số lớn nhất trong toàn bộ hóa đơn
     all_nums = []
-    for b in all_blocks:
-        norm = normalize(b.text)
-        if any(kw in norm for kw in _NOT_TOTAL_KW): continue
-        all_nums.extend(extract_numbers_from_line(b.text))
+    for block in ordered:
+        text = _block_text(block)
+        norm = normalize(text)
+        if any(kw in norm for kw in _NOT_TOTAL_KW):
+            continue
+        all_nums.extend(extract_numbers_from_line(text))
 
     valid = [n for n in all_nums if 1_000 <= n <= 100_000_000]
     return max(valid) if valid else None
