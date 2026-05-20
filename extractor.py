@@ -542,6 +542,7 @@ def extract_receipt(blocks: list) -> dict:
     receipt_type = "normal"      → hóa đơn 1 dịch vụ (cafe, grab, ...)
     receipt_type = "supermarket" → hóa đơn nhiều sản phẩm
     """
+    # Tách text blocks sang dataclass để mọi bước xử lý sau đều dùng một cấu trúc thống nhất.
     text_blocks = [
         TextBlock(
             text   = b.get('text', '').strip(),

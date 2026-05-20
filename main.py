@@ -544,6 +544,7 @@ def classify_text_debug(req: ClassifyRequest):
 
 @app.post("/receipt")
 def process_receipt(req: ReceiptRequest):
+	# Endpoint chính của OCR: ghép extractor với classifier để trả kết quả cuối cùng cho app.
 	from extractor import extract_receipt
 
 	blocks = [b.model_dump() for b in req.blocks]
